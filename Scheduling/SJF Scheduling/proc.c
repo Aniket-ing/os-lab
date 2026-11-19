@@ -572,34 +572,35 @@ scheduler(void)
     // Enable interrupts on this processor.
     sti();
     
-		acquire(&ptable.lock);
-		// To store the job with least burst time
-    struct proc *shortest_job = 0;
+    acquire(&ptable.lock);
 
-		// Find the job with least burst time
-    if(heap.minheap.size>0)
-      shortest_job = heap.minheap.arr[0];
-    
-    if (shortest_job)
-    {
-      p = shortest_job;
-      //cprintf("BT%d \n", p->burst);
-      // Switch to chosen process.  It is the process's job
+    // Select and remove the shortest job atomically.
+    // Once dispatched, a process must not remain in the ready heap.
+    acquire(&heap.lock);
+    p = 0;
+    if(heap.minheap.size > 0){
+      p = heap.minheap.arr[0];
+      delete_minimum(&heap.minheap);
+    }
+    release(&heap.lock);
+
+    if(p){
+      // Switch to chosen process. It is the process's job
       // to release ptable.lock and then reacquire it
       // before jumping back to us.
       c->proc = p;
-      p->time_quanta=quanta;
+      p->time_quanta = quanta;
       switchuvm(p);
       p->state = RUNNING;
 
       swtch(&(c->scheduler), p->context);
-      
-      // increment number of context switches
+
+      // Increment number of context switches.
       p->contextswitches = p->contextswitches + 1;
       switchkvm();
 
       // Process is done running for now.
-      // It should have changed its p->state before coming back.
+      // It should have changed its state before coming back.
       c->proc = 0;
     }
     release(&ptable.lock);
@@ -640,22 +641,9 @@ sched(void)
     panic("sched interruptible");
   intena = mycpu()->intena;
 
-// check state before exitting
-  // if(p->state == ZOMBIE)
-  // {
-    acquire(&heap.lock);
-    int index = -1;
-    for(index=0;index<heap.minheap.size;index++)
-    {
-      if(heap.minheap.arr[index]==p)
-      {
-        delete_element(&heap.minheap,index);
-        break;
-      }
-    }
-    release(&heap.lock);
-  // }
-
+// The running process was already removed from the ready heap
+  // by scheduler() when it was dispatched. No heap deletion is
+  // required here.
   swtch(&p->context, mycpu()->scheduler);
   mycpu()->intena = intena;
 }
