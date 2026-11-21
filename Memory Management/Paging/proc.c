@@ -17,6 +17,9 @@ int swap_in_process_exists=0;
 
 int mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm);
 
+// x86 page-table dirty bit (set by hardware after a write).
+#define PTE_D 0x040
+
 int
 proc_close(int fd)
 {
@@ -241,71 +244,119 @@ int rpush2(struct proc* p){
 }
 
  
+// Small kernel-side PRNG used to choose randomly among pages in the
+// lowest non-empty NRU class.
+static uint nru_random(uint limit)
+{
+  static uint state = 1;
+  state = state * 1664525U + 1013904223U;
+  return state % limit;
+}
+
 void swap_out_process_function(){
+  struct proc *p;
 
-  acquire(&queue1.lock);
-  while(queue1.s!=queue1.e){
-    struct proc *p=rpop();
+  // rpop() acquires queue1.lock itself, so do not hold that lock here.
+  while((p = rpop()) != 0){
+    pde_t *pd = p->pgdir;
+    pte_t *victim_pte = 0;
+    uint victim_va = 0;
+    int best_class = 4;
+    uint class_count = 0;
+    uint va;
 
-    pde_t* pd = p->pgdir;
-    for(int i=0;i<NPDENTRIES;i++){
+    // NRU classes (R = referenced, M = modified/dirty):
+    // 0: R=0, M=0   1: R=0, M=1
+    // 2: R=1, M=0   3: R=1, M=1
+    // First find the lowest-numbered non-empty class.
+    for(va = 0; va < p->sz; va += PGSIZE){
+      pde_t *pde = &pd[PDX(va)];
+      pte_t *pgtab;
+      pte_t entry;
+      int page_class;
 
-      //skip page table if accessed. chances are high, not every page table was accessed.
-      if(pd[i]&PTE_A)
+      if(!(*pde & PTE_P))
         continue;
-      //else
-      pte_t *pgtab = (pte_t*)P2V(PTE_ADDR(pd[i]));
-      for(int j=0;j<NPTENTRIES;j++){
+      pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+      entry = pgtab[PTX(va)];
+      if(!(entry & PTE_P))
+        continue;
 
-        //Skip if found
-        if((pgtab[j]&PTE_A) || !(pgtab[j]&PTE_P))
-          continue;
-        pte_t *pte=(pte_t*)P2V(PTE_ADDR(pgtab[j]));
-
-        //for file name
-        int pid=p->pid;
-        int virt = ((1<<22)*i)+((1<<12)*j);
-
-        //file name
-        char c[50];
-        int_to_string(pid,c);
-        int x=strlen(c);
-        c[x]='_';
-        int_to_string(virt,c+x+1);
-        safestrcpy(c+strlen(c),".swp",5);
-
-        // file management
-        int fd=proc_open(c, O_CREATE | O_RDWR);
-        if(fd<0){
-          cprintf("error creating or opening file: %s\n", c);
-          panic("swap_out_process");
-        }
-
-        if(proc_write(fd,(char *)pte, PGSIZE) != PGSIZE){
-          cprintf("error writing to file: %s\n", c);
-          panic("swap_out_process");
-        }
-        proc_close(fd);
-
-        kfree((char*)pte);
-        memset(&pgtab[j],0,sizeof(pgtab[j]));
-
-        //mark this page as being swapped out.
-        pgtab[j]=((pgtab[j])^(0x080));
-
-        break;
+      page_class = ((entry & PTE_A) ? 2 : 0) +
+                   ((entry & PTE_D) ? 1 : 0);
+      if(page_class < best_class){
+        best_class = page_class;
+        class_count = 1;
+      } else if(page_class == best_class){
+        class_count++;
       }
     }
 
+    // No resident user page was available for this process.
+    if(class_count == 0)
+      continue;
+
+    // NRU selects a random page from the lowest non-empty class.
+    uint selected = nru_random(class_count);
+    for(va = 0; va < p->sz; va += PGSIZE){
+      pde_t *pde = &pd[PDX(va)];
+      pte_t *pgtab;
+      pte_t entry;
+      int page_class;
+
+      if(!(*pde & PTE_P))
+        continue;
+      pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+      entry = pgtab[PTX(va)];
+      if(!(entry & PTE_P))
+        continue;
+
+      page_class = ((entry & PTE_A) ? 2 : 0) +
+                   ((entry & PTE_D) ? 1 : 0);
+      if(page_class != best_class)
+        continue;
+
+      if(selected == 0){
+        victim_pte = &pgtab[PTX(va)];
+        victim_va = va;
+        break;
+      }
+      selected--;
+    }
+
+    if(victim_pte == 0)
+      continue;
+
+    // Build the swap-file name: PID_virtual-address.swp
+    char c[50];
+    int_to_string(p->pid, c);
+    int x = strlen(c);
+    c[x] = '_';
+    int_to_string(victim_va, c + x + 1);
+    safestrcpy(c + strlen(c), ".swp", 5);
+
+    // Write the selected physical page to its swap file.
+    char *page = (char*)P2V(PTE_ADDR(*victim_pte));
+    int fd = proc_open(c, O_CREATE | O_RDWR);
+    if(fd < 0){
+      cprintf("error creating or opening file: %s\n", c);
+      panic("swap_out_process");
+    }
+    if(proc_write(fd, page, PGSIZE) != PGSIZE){
+      cprintf("error writing to file: %s\n", c);
+      panic("swap_out_process");
+    }
+    proc_close(fd);
+
+    // Release the frame and leave the existing 0x080 swap marker.
+    kfree(page);
+    *victim_pte = 0x080;
   }
 
-  release(&queue1.lock);
-  
-  struct proc *p;
-  if((p=myproc())==0)
+  if((p = myproc()) == 0)
     panic("swap out process");
 
-  swap_out_process_exists=0;
+  swap_out_process_exists = 0;
   p->parent = 0;
   p->name[0] = '*';
   p->killed = 0;
